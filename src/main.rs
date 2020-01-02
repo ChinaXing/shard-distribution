@@ -1,6 +1,6 @@
 use clap::{clap_app, value_t};
 use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
@@ -8,41 +8,96 @@ use std::io::prelude::*;
 const REPLICATION: usize = 3;
 
 struct Matrix {
+    start_from: i32,
     rows: usize,
     cols: usize,
     replication: usize,
-    rank_order: usize,
-    data: Vec<Vec<usize>>,
+    rank_cycle: usize,
+    third_shift: Vec<usize>,
+    data: Vec<Vec<i64>>,
+}
+
+pub fn build_third_shift(rank_cycle: usize, rank_size: usize) -> Vec<usize> {
+    match (rank_cycle, rank_size) {
+        (17, 18) => vec![1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 2],
+        _ => panic!("can not handle rank_cycle !!"),
+    }
 }
 
 impl Matrix {
-    pub fn new(r: usize, c: usize, rep: usize, order: usize) -> Matrix {
+    pub fn new(r: usize, c: usize, rep: usize, s: i32) -> Matrix {
+        let rc = if (c - 1) % 2 == 0 { (c - 1) / 2 } else { c - 1 };
+        let ts = build_third_shift(rc, c);
         Matrix {
+            start_from: s,
             rows: r,
             cols: c,
             replication: rep,
-            rank_order: order,
+            rank_cycle: rc,
+            third_shift: ts,
             data: vec![vec![0; r as usize]; c as usize],
         }
     }
 }
 
+pub trait DumpToJava {
+    fn to_java(&self) -> ();
+}
+
+impl DumpToJava for Matrix {
+    fn to_java(&self) -> () {
+        let data = &self.data;
+        println!("new int[][]{{");
+        for c in 0..self.cols {
+            if c != 0 {
+                println!(",");
+            }
+            print!("\tnew int[]{{");
+            for r in 0..self.rows {
+                if r == 0 {
+                    print!("{}", data[c][r]);
+                } else {
+                    print!(", {}", data[c][r]);
+                }
+            }
+            print!("}}");
+        }
+        println!("\n}}");
+    }
+}
+
 impl fmt::Display for Matrix {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let data: &Vec<Vec<usize>> = &self.data;
+        let data: &Vec<Vec<i64>> = &self.data;
         writeln!(f, "** Shard Distribution ::").unwrap();
+        write!(f, "    ")?;
         for c in 0..self.cols {
             write!(f, "N-{:^03} ", c)?;
         }
         writeln!(f, "")?;
+        let mut distinc_each_col: Vec<HashSet<i64>> = vec![];
+        for _ in 0..self.cols {
+            distinc_each_col.push(HashSet::new());
+        }
         for r in 0..self.rows {
+            write!(f, "{:<3} ", r + 1)?;
             for c in 0..self.cols {
                 let col = &data[c as usize];
-                write!(f, "[{:<3}] ", col[r as usize])?;
+                let v = col[r as usize];
+                if r % self.replication < self.replication - 1 {
+                    write!(f, "[{:<3}] ", v)?;
+                } else {
+                    write!(f, "<{:<3}> ", v)?;
+                }
+                distinc_each_col[c].insert(v);
             }
             writeln!(f, "")?;
         }
-        write!(f, "")
+        write!(f, "    ")?;
+        for c in 0..self.cols {
+            write!(f, " {:<3}  ", distinc_each_col[c].len())?;
+        }
+        write!(f, "\n")
     }
 }
 
@@ -54,15 +109,13 @@ impl DotGraph for Matrix {
     fn g(&self, fail_col: Option<usize>, output_file: &str) -> () {
         let mut leader_rows = BTreeSet::new();
         for r in (0..self.rows).step_by(self.replication) {
-            let rank = r / self.replication / self.rank_order;
-            let leader_row = if rank % 2 == 0 { r + 1 } else { r };
-            leader_rows.insert(leader_row);
+            leader_rows.insert(r);
         }
         println!("Leader_rows : {:?}", leader_rows);
 
         let mut fail_leaders = fail_col.and_then(|x| {
             let col_data = &self.data[x];
-            let result: Vec<usize> = leader_rows.iter().map(|c| col_data[*c]).collect();
+            let result: Vec<i64> = leader_rows.iter().map(|c| col_data[*c]).collect();
             Some(result)
         });
         println!("Failed_leaders : {:?}", fail_leaders);
@@ -76,7 +129,7 @@ impl DotGraph for Matrix {
         });
 
         // shard-number -> node-number(column-no)
-        let mut leader_failover: Vec<(usize, usize)> = vec![];
+        let mut leader_failover: Vec<(i64, usize)> = vec![];
         let mut f = File::create(output_file).unwrap();
         writeln!(f, "digraph G {{").unwrap();
         writeln!(f, "\trankdir=LR;").unwrap();
@@ -107,7 +160,7 @@ impl DotGraph for Matrix {
                                 .as_mut()
                                 .and_then(|z| {
                                     if z[group as usize] == v && r % self.replication <= 1 {
-                                        z[group as usize] = 9999 as usize;
+                                        z[group as usize] = 9999 as i64;
                                         leader_failover.push((v, c));
                                         Some(&v)
                                     } else {
@@ -197,10 +250,10 @@ fn main() {
                             (author: "ChinaXing")
                             (about: "calculate shard distribution on multiple nodes")
                             (@arg matrix: -m --matrix "show matrix")
-                            (@arg deltaByRankOrder: -d --delta "show fail distribution delta change by rank-order")
-                            (@arg rankOrder: -r --rankOrder +takes_value "rank cycle size")
                             (@arg failColumn: -f --failColumn +takes_value "mark failed column, start from 0")
                             (@arg generateGraph: -g --generateDotGraph +takes_value "generate dot graph to file")
+                            (@arg javaArray: -j --generateJavaArray "generate a javaArray for matrix")
+                            (@arg matrixStart: -s --matrixStart +takes_value "start no of matrix, default 0")
                             (@arg shardsPerNode: +required "shard num per node")
                             (@arg nodeCount: +required "Node count")
             )
@@ -208,92 +261,40 @@ fn main() {
     let rows = value_t!(matches.value_of("shardsPerNode"), usize).unwrap();
     let cols = value_t!(matches.value_of("nodeCount"), usize).unwrap();
     let fail_col = value_t!(matches.value_of("failColumn"), usize);
-    let rank_order = value_t!(matches.value_of("rankOrder"), usize).unwrap();
     let graph = matches.is_present("generateGraph");
-    let delta = matches.is_present("deltaByRankOrder");
-    let m = distribute(rows, cols, rank_order);
+    let start_index = value_t!(matches.value_of("matrixStart"), i32);
+    let m = distribute(rows, cols, start_index.unwrap_or(0));
     if matches.is_present("matrix") {
         println!("{}", m);
+    }
+    if matches.is_present("javaArray") {
+        println!("** Java Array ::");
+        m.to_java();
     }
     let fc: Option<usize> = fail_col.ok().clone();
     if graph {
         let graph_file = matches.value_of("generateGraph").unwrap();
         m.g(fc, graph_file);
     }
-
-    if delta && fc.is_some() {
-        println!("** Fail Delta Distribution ::");
-        let fail_dist = fail_distri_with_rank_order(rows, cols, fc.unwrap());
-        let mut keys = fail_dist.keys().collect::<Vec<&usize>>();
-        keys.sort();
-        for k in keys {
-            let vs = fail_dist.get(k).unwrap();
-            let delta = vs.iter().max().unwrap() - vs.iter().min().unwrap();
-            println!("{}: delta: {} => {:?}", k, delta, fail_dist.get(k).unwrap());
-        }
-    }
 }
 
-fn distribute(rows: usize, cols: usize, rank_order: usize) -> Matrix {
-    let mut m: Matrix = Matrix::new(rows, cols, REPLICATION, rank_order);
+fn distribute(rows: usize, cols: usize, start: i32) -> Matrix {
+    let mut m: Matrix = Matrix::new(rows, cols, REPLICATION, start);
     for r in 0..rows {
-        let replication_index = r % m.replication;
-        let rank = (r / m.replication) % rank_order + 1;
-        let incremental = if replication_index == 0 {
-            0
-        } else {
-            (rank * replication_index) + (replication_index - 1)
+        let rank = r / m.replication;
+        let rep_index = r % m.replication;
+        let base = rank * cols;
+        let offset = match rep_index {
+            0 => 0,
+            1 => rank % m.rank_cycle + 1,
+            2 => rank % m.rank_cycle + 1 + m.third_shift[rank % m.rank_cycle],
+            _ => panic!("invalid rep_index"),
         };
-        let base = (r / m.replication) * cols;
-        let put_order_asc = rank % 2 == 1;
         for c in 0..cols {
-            let v = base + ((incremental + c) % cols);
-            let idx = if put_order_asc {
-                c as usize
-            } else {
-                (cols - 1 - c) as usize
-            };
-            let cl = &mut m.data[idx];
-            cl[r as usize] = v;
+            let v = base + (offset + c) % cols;
+            let cl = &mut m.data[c];
+            cl[r as usize] = (v as i64) + (m.start_from as i64);
         }
     }
     m
-}
-
-fn fail_distri_with_rank_order(
-    rows: usize,
-    cols: usize,
-    fail_col: usize,
-) -> HashMap<usize, Vec<usize>> {
-    let mut result = HashMap::new();
-    for rank in 1..cols {
-        let m = distribute(rows, cols, rank);
-        result.insert(rank, calc_fail_distri(&m, fail_col));
-    }
-    result
-}
-
-fn calc_fail_distri(m: &Matrix, fail_col: usize) -> Vec<usize> {
-    let mut result = vec![];
-    let col = &m.data[fail_col];
-    let mut col_nodes = BTreeSet::new();
-    for r in 0..m.rows {
-        col_nodes.insert(col[r]);
-    }
-    for c in 0..m.cols {
-        if c == fail_col {
-            continue;
-        }
-        let mut cnt = 0;
-        let mut fails: Vec<String> = vec![];
-        for r in 0..m.rows {
-            let cell = m.data[c][r];
-            if col_nodes.contains(&cell) {
-                fails.push(format!("({},{}){}", c, r, cell));
-                cnt += 1;
-            }
-        }
-        result.push(cnt);
-    }
-    result
 }
