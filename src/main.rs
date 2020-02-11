@@ -69,10 +69,12 @@ impl DumpToJava for Matrix {
 impl fmt::Display for Matrix {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let data: &Vec<Vec<i64>> = &self.data;
+        let col_width: usize = (self.cols * self.rows).to_string().len();
+
         writeln!(f, "** Shard Distribution ::").unwrap();
-        write!(f, "    ")?;
+        write!(f, "{:<w$}", ' ', w = col_width + 1)?;
         for c in 0..self.cols {
-            write!(f, "N-{:^03} ", c)?;
+            write!(f, "N-{c:<0w$} ", c = c, w = col_width)?;
         }
         writeln!(f, "")?;
         let mut distinc_each_col: Vec<HashSet<i64>> = vec![];
@@ -80,14 +82,14 @@ impl fmt::Display for Matrix {
             distinc_each_col.push(HashSet::new());
         }
         for r in 0..self.rows {
-            write!(f, "{:<3} ", r + 1)?;
+            write!(f, "{:<w$} ", r + 1, w = col_width)?;
             for c in 0..self.cols {
                 let col = &data[c as usize];
                 let v = col[r as usize];
                 if r % self.replication < self.replication - 1 {
-                    write!(f, "[{:<3}] ", v)?;
+                    write!(f, "[{:>w$}] ", v, w = col_width)?;
                 } else {
-                    write!(f, "<{:<3}> ", v)?;
+                    write!(f, "<{:>w$}> ", v, w = col_width)?;
                 }
                 distinc_each_col[c].insert(v);
             }
@@ -95,7 +97,7 @@ impl fmt::Display for Matrix {
         }
         write!(f, "    ")?;
         for c in 0..self.cols {
-            write!(f, " {:<3}  ", distinc_each_col[c].len())?;
+            write!(f, " {:>w$}  ", distinc_each_col[c].len(), w = col_width)?;
         }
         write!(f, "\n")
     }
