@@ -5,6 +5,9 @@ use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 
+#[macro_use]
+extern crate lazy_static;
+
 const REPLICATION: usize = 3;
 
 struct Matrix {
@@ -17,11 +20,29 @@ struct Matrix {
     data: Vec<Vec<i64>>,
 }
 
+lazy_static! {
+    static ref S18: Vec<usize> = [ // skip 8 (18/2-1)
+        (1usize..=7).collect::<Vec<usize>>().as_slice(),
+        (9..=17).collect::<Vec<usize>>().as_slice(),
+        &[2usize],
+    ]
+    .concat();
+    static ref S42: Vec<usize> = [ // skip 20 (42/2-1)
+        (1usize..=19).collect::<Vec<usize>>().as_slice(),
+        (21..=41).collect::<Vec<usize>>().as_slice(),
+        &[2usize],
+    ]
+    .concat();
+}
+
 pub fn build_third_shift(rank_cycle: usize, rank_size: usize) -> Vec<usize> {
-    match (rank_cycle, rank_size) {
-        (17, 18) => vec![1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 2],
+    let r = match (rank_cycle, rank_size) {
+        (17, 18) => S18.to_vec(),
+        (41, 42) => S42.to_vec(),
         _ => panic!("can not handle rank_cycle !!"),
-    }
+    };
+    println!("- third replica shift: {:?}", r);
+    r
 }
 
 impl Matrix {
@@ -132,6 +153,8 @@ impl DotGraph for Matrix {
 
         // shard-number -> node-number(column-no)
         let mut leader_failover: Vec<(i64, usize)> = vec![];
+        let mut node_leader_failover_to_nr: Vec<usize> = vec![0; self.cols];
+        let mut node_failover_to_nr: Vec<usize> = vec![0; self.cols];
         let mut f = File::create(output_file).unwrap();
         writeln!(f, "digraph G {{").unwrap();
         writeln!(f, "\trankdir=LR;").unwrap();
@@ -205,6 +228,8 @@ impl DotGraph for Matrix {
             writeln!(f, "<tr><td bgcolor=\"green\">{}</td></tr>", fail_hit_cnt).unwrap();
             writeln!(f, "<tr><td bgcolor=\"yellow\">{}</td></tr>", leader_hit_cnt).unwrap();
             writeln!(f, "</table>>];").unwrap();
+            node_failover_to_nr[c] = fail_hit_cnt;
+            node_leader_failover_to_nr[c] = leader_hit_cnt;
         }
         let color_cycle = ["black", "red"];
         for group in 0..self.rows / self.replication {
@@ -242,7 +267,17 @@ impl DotGraph for Matrix {
         }
         writeln!(f, "}}").unwrap();
         f.flush().unwrap();
-        println!("\nleader_fail_over:\n {:?}", leader_failover);
+        println!("\nLeader_fail_over:\n {:?}", leader_failover);
+        println!("\nFailover distribution:");
+        for c in 0..self.cols {
+            println!(
+                "{:>w$} -> fail_over_hit: {} leader_hit: {}",
+                c,
+                node_failover_to_nr[c],
+                node_leader_failover_to_nr[c],
+                w = 2
+            );
+        }
     }
 }
 
