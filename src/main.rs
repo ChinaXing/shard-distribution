@@ -36,19 +36,40 @@ lazy_static! {
 }
 
 pub fn build_third_shift(rank_cycle: usize, rank_size: usize) -> Vec<usize> {
-    let r = match (rank_cycle, rank_size) {
-        (17, 18) => S18.to_vec(),
-        (41, 42) => S42.to_vec(),
-        _ => panic!("can not handle rank_cycle !!"),
+    let r = if rank_size % 2 == 1 {
+        (1usize..=rank_cycle).collect::<Vec<usize>>()
+    } else {
+        match (rank_cycle, rank_size) {
+            (17, 18) => S18.to_vec(),
+            (41, 42) => S42.to_vec(),
+            _ => panic!("can not handle rank_cycle !!"),
+        }
     };
-    println!("- third replica shift: {:?}", r);
+    println!("- Third Replica Shift: {:?}", r);
     r
 }
 
 impl Matrix {
-    pub fn new(r: usize, c: usize, rep: usize, s: i32) -> Matrix {
-        let rc = if (c - 1) % 2 == 0 { (c - 1) / 2 } else { c - 1 };
+    pub fn new(r: usize, c: usize, rep: usize, s: i32, third_failover: bool) -> Matrix {
+        let rc = if (c - 1) % 2 == 0 {
+            if third_failover {
+                // if third replica can failover as leader ?
+                (c - 1) / 2
+            } else {
+                c - 1
+            }
+        } else {
+            c - 1
+        };
+        println!("- Rank Cycle : {}", rc);
         let ts = build_third_shift(rc, c);
+        // check cols
+        if c % (rep * rc) != 0 {
+            panic!(
+                "cols must multiply of : replication * rank_cycle = {} * {}",
+                rep, rc
+            );
+        }
         Matrix {
             start_from: s,
             rows: r,
@@ -124,12 +145,21 @@ impl fmt::Display for Matrix {
     }
 }
 
+macro_rules! write_file_option {
+    ($file:expr, $($arg:tt)*) => (
+        if $file.is_some() {
+            let mut f = $file.unwrap();
+            writeln!(f, $($arg)*).unwrap();
+        }
+    );
+}
+
 pub trait DotGraph {
-    fn g(&self, fail_col: Option<usize>, output_file: &str) -> ();
+    fn g(&self, fail_col: Option<usize>, output_file: Option<&str>) -> ();
 }
 
 impl DotGraph for Matrix {
-    fn g(&self, fail_col: Option<usize>, output_file: &str) -> () {
+    fn g(&self, fail_col: Option<usize>, output_file: Option<&str>) -> () {
         let mut leader_rows = BTreeSet::new();
         for r in (0..self.rows).step_by(self.replication) {
             leader_rows.insert(r);
@@ -155,22 +185,28 @@ impl DotGraph for Matrix {
         let mut leader_failover: Vec<(i64, usize)> = vec![];
         let mut node_leader_failover_to_nr: Vec<usize> = vec![0; self.cols];
         let mut node_failover_to_nr: Vec<usize> = vec![0; self.cols];
-        let mut f = File::create(output_file).unwrap();
-        writeln!(f, "digraph G {{").unwrap();
-        writeln!(f, "\trankdir=LR;").unwrap();
+        let fr = output_file.and_then(|x| {
+            let f = File::create(x).unwrap();
+            Some(f)
+        });
+        let file = fr.as_ref();
+        write_file_option!(file, "digraph G {{");
+        write_file_option!(file, "\trankdir=LR;");
         let data = &self.data;
         for c in 0..self.cols {
-            writeln!(
-                f,
+            write_file_option!(
+                file,
                 "\thost{} [shape=none label=<<table><tr><td bgcolor=\"black\"><font color=\"white\">Node-{}</font></td></tr>",
                 c, c,
-            )
-            .unwrap();
+            );
             let mut fail_hit_cnt = 0;
             let mut leader_hit_cnt = 0;
             for r in 0..self.rows {
                 let v = data[c as usize][r as usize];
                 let group = r / self.replication;
+                let failover_leader_target_replica =
+                    (group / self.rank_cycle) % (self.cols / self.rank_cycle) + 1;
+                //println!("the fo_l_t_r : {}", failover_leader_target_replica);
                 let top = r % self.replication == 0;
                 let is_leader_row = leader_rows.contains(&r);
                 let fail_cell =
@@ -184,8 +220,10 @@ impl DotGraph for Matrix {
                             && fail_leaders
                                 .as_mut()
                                 .and_then(|z| {
-                                    if z[group as usize] == v && r % self.replication <= 1 {
-                                        z[group as usize] = 9999 as i64;
+                                    if z[group as usize] == v
+                                        && r % self.replication == failover_leader_target_replica
+                                    {
+                                        z[group as usize] = -v as i64;
                                         leader_failover.push((v, c));
                                         Some(&v)
                                     } else {
@@ -200,34 +238,52 @@ impl DotGraph for Matrix {
                             "blue"
                         };
                         if top {
-                            writeln!(
-                                f,
+                            write_file_option!(
+                                file,
                                 "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>",
-                                color, c, group, v
-                            )
-                            .unwrap();
+                                color,
+                                c,
+                                group,
+                                v
+                            );
                         } else {
-                            writeln!(f, "<tr><td bgcolor=\"{}\">{}</td></tr>", color, v).unwrap();
+                            write_file_option!(
+                                file,
+                                "<tr><td bgcolor=\"{}\">{}</td></tr>",
+                                color,
+                                v
+                            );
                         }
                     }
                     None => {
                         let color = if is_leader_row { "orange" } else { "white" };
                         if top {
-                            writeln!(
-                                f,
+                            write_file_option!(
+                                file,
                                 "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>",
-                                color, c, group, v
-                            )
-                            .unwrap();
+                                color,
+                                c,
+                                group,
+                                v
+                            );
                         } else {
-                            writeln!(f, "<tr><td bgcolor=\"{}\">{}</td></tr>", color, v).unwrap();
+                            write_file_option!(
+                                file,
+                                "<tr><td bgcolor=\"{}\">{}</td></tr>",
+                                color,
+                                v
+                            );
                         }
                     }
                 }
             }
-            writeln!(f, "<tr><td bgcolor=\"green\">{}</td></tr>", fail_hit_cnt).unwrap();
-            writeln!(f, "<tr><td bgcolor=\"yellow\">{}</td></tr>", leader_hit_cnt).unwrap();
-            writeln!(f, "</table>>];").unwrap();
+            write_file_option!(file, "<tr><td bgcolor=\"green\">{}</td></tr>", fail_hit_cnt);
+            write_file_option!(
+                file,
+                "<tr><td bgcolor=\"yellow\">{}</td></tr>",
+                leader_hit_cnt
+            );
+            write_file_option!(file, "</table>>];");
             node_failover_to_nr[c] = fail_hit_cnt;
             node_leader_failover_to_nr[c] = leader_hit_cnt;
         }
@@ -236,8 +292,8 @@ impl DotGraph for Matrix {
             let color = color_cycle[(group % 2) as usize];
             for c in 0..self.cols - 1 {
                 if c > 0 {
-                    writeln!(
-                        f,
+                    write_file_option!(
+                        file,
                         "\thost{}:g{}{} -> host{}:g{}{} [ color=\"{}\" ];",
                         c,
                         c,
@@ -246,11 +302,10 @@ impl DotGraph for Matrix {
                         c + 1,
                         group,
                         color
-                    )
-                    .unwrap();
+                    );
                 } else {
-                    write!(
-                        f,
+                    write_file_option!(
+                        file,
                         "\thost{}:g{}{} -> host{}:g{}{} [ label=\"group{}\" color=\"{}\"];",
                         c,
                         c,
@@ -260,13 +315,14 @@ impl DotGraph for Matrix {
                         group,
                         group,
                         color
-                    )
-                    .unwrap();
+                    );
                 }
             }
         }
-        writeln!(f, "}}").unwrap();
-        f.flush().unwrap();
+        write_file_option!(file, "}}");
+        if file.is_some() {
+            file.unwrap().flush().unwrap();
+        }
         println!("\nLeader_fail_over:\n {:?}", leader_failover);
         println!("\nFailover distribution:");
         for c in 0..self.cols {
@@ -287,6 +343,7 @@ fn main() {
                             (author: "ChinaXing")
                             (about: "calculate shard distribution on multiple nodes")
                             (@arg matrix: -m --matrix "show matrix")
+                            (@arg thirdReplicaFailoverable: -t --thirdReplicaFailoverable "third replica can takeover for leader")
                             (@arg failColumn: -f --failColumn +takes_value "mark failed column, start from 0")
                             (@arg generateGraph: -g --generateDotGraph +takes_value "generate dot graph to file")
                             (@arg javaArray: -j --generateJavaArray "generate a javaArray for matrix")
@@ -298,9 +355,9 @@ fn main() {
     let rows = value_t!(matches.value_of("shardsPerNode"), usize).unwrap();
     let cols = value_t!(matches.value_of("nodeCount"), usize).unwrap();
     let fail_col = value_t!(matches.value_of("failColumn"), usize);
-    let graph = matches.is_present("generateGraph");
     let start_index = value_t!(matches.value_of("matrixStart"), i32);
-    let m = distribute(rows, cols, start_index.unwrap_or(0));
+    let trf = matches.is_present("thirdReplicaFailoverable");
+    let m = distribute(rows, cols, start_index.unwrap_or(0), trf);
     if matches.is_present("matrix") {
         println!("{}", m);
     }
@@ -308,15 +365,13 @@ fn main() {
         println!("** Java Array ::");
         m.to_java();
     }
-    let fc: Option<usize> = fail_col.ok().clone();
-    if graph {
-        let graph_file = matches.value_of("generateGraph").unwrap();
-        m.g(fc, graph_file);
-    }
+    let fc: Option<usize> = fail_col.ok();
+    let graph_file: Option<&str> = matches.value_of("generateGraph");
+    m.g(fc, graph_file);
 }
 
-fn distribute(rows: usize, cols: usize, start: i32) -> Matrix {
-    let mut m: Matrix = Matrix::new(rows, cols, REPLICATION, start);
+fn distribute(rows: usize, cols: usize, start: i32, third_replica_failoverable: bool) -> Matrix {
+    let mut m: Matrix = Matrix::new(rows, cols, REPLICATION, start, third_replica_failoverable);
     for r in 0..rows {
         let rank = r / m.replication;
         let rep_index = r % m.replication;
