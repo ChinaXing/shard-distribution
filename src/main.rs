@@ -301,7 +301,7 @@ fn main() {
                     (@arg matrix: -m --matrix "show matrix")
                     (@arg balanceLeaderWhenFailOver: -l --balanceLeaderWhenFailOver "leader failover must can be balanced")
                     (@arg failColumn: -f --failColumn +takes_value "mark failed column, start from 0")
-                    (@arg generateGraph: -g --generateDotGraph +takes_value "generate dot graph to file, you can use online graphviz viewer to view it")
+                    (@arg dotGraphFile: -g --generateDotGraph +takes_value "generate dot graph to file, you can use online graphviz viewer to view it")
                     (@arg javaArray: -j --generateJavaArray "generate a javaArray for matrix")
                     (@arg matrixStart: -s --matrixStart +takes_value "start no of matrix, default 0")
                     (@arg shardsPerNode: +required "shard num per node")
@@ -322,7 +322,7 @@ fn main() {
         m.to_java();
     }
     let fc: Option<usize> = fail_col.ok();
-    let graph_file: Option<&str> = matches.value_of("generateGraph");
+    let graph_file: Option<&str> = matches.value_of("dotGraphFile");
     m.g(fc, graph_file);
 }
 
