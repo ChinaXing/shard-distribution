@@ -50,25 +50,23 @@ pub fn build_third_shift(rank_cycle: usize, rank_size: usize) -> Vec<usize> {
 }
 
 impl Matrix {
-    pub fn new(r: usize, c: usize, rep: usize, s: i32, third_failover: bool) -> Matrix {
+    pub fn new(r: usize, c: usize, rep: usize, s: i32, balance_leader_when_failover: bool) -> Matrix {
         let rc = if (c - 1) % 2 == 0 {
-            if third_failover {
-                // if third replica can failover as leader ?
-                (c - 1) / 2
-            } else {
+            // if leader must balance after failover, we need double the minimal rank cycle,
+            // because it will be half of health nodes
+            if balance_leader_when_failover {
                 c - 1
+            } else {
+                (c - 1) / 2
             }
         } else {
             c - 1
         };
         println!("- Rank Cycle : {}", rc);
         let ts = build_third_shift(rc, c);
-        // check cols
-        if c % (rep * rc) != 0 {
-            panic!(
-                "cols must multiply of : replication * rank_cycle = {} * {}",
-                rep, rc
-            );
+        // check rows
+        if r % (rep * rc) != 0 {
+            panic!("rows : {} must multiple of : replication * rank_cycle = {} * {}", r, rep, rc);
         }
         Matrix {
             start_from: s,
@@ -164,14 +162,14 @@ impl DotGraph for Matrix {
         for r in (0..self.rows).step_by(self.replication) {
             leader_rows.insert(r);
         }
-        println!("Leader_rows : {:?}", leader_rows);
+        println!("- Leader_rows : {:?}", leader_rows);
 
         let mut fail_leaders = fail_col.and_then(|x| {
             let col_data = &self.data[x];
             let result: Vec<i64> = leader_rows.iter().map(|c| col_data[*c]).collect();
             Some(result)
         });
-        println!("Failed_leaders : {:?}", fail_leaders);
+        println!("- Failed_leaders : {:?}", fail_leaders);
 
         let fail_col_values = fail_col.and_then(|x| {
             let mut set = BTreeSet::new();
@@ -193,129 +191,93 @@ impl DotGraph for Matrix {
         write_file_option!(file, "digraph G {{");
         write_file_option!(file, "\trankdir=LR;");
         let data = &self.data;
+        let leader_fail_match = |rank: usize, row: usize, col: usize, v: i64, fc: Option<usize>, fl: Option<&Vec<i64>>| {
+            fc.and_then(|x| {
+                if x != col {
+                    Some(x)
+                } else {
+                    None
+                }
+            })
+            .and_then(move |_y| {
+                fl.and_then(move |z| {
+                    if z[rank] == v && row % self.replication == 1 {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                })
+            })
+        };
         for c in 0..self.cols {
-            write_file_option!(
-                file,
-                "\thost{} [shape=none label=<<table><tr><td bgcolor=\"black\"><font color=\"white\">Node-{}</font></td></tr>",
-                c, c,
-            );
+            write_file_option!(file, "\thost{} [shape=none label=<<table><tr><td bgcolor=\"black\"><font color=\"white\">Node-{}</font></td></tr>", c, c,);
             let mut fail_hit_cnt = 0;
             let mut leader_hit_cnt = 0;
             for r in 0..self.rows {
                 let v = data[c as usize][r as usize];
-                let group = r / self.replication;
-                let failover_leader_target_replica =
-                    (group / self.rank_cycle) % (self.cols / self.rank_cycle) + 1;
-                //println!("the fo_l_t_r : {}", failover_leader_target_replica);
+                let rank = r / self.replication as usize;
+                // (group / self.rank_cycle) % (self.cols / self.rank_cycle) + 1;
+                // println!("the fo_l_t_r : {} -> {} -> {}", group, r, failover_leader_target_replica);
                 let top = r % self.replication == 0;
                 let is_leader_row = leader_rows.contains(&r);
-                let fail_cell =
-                    fail_col_values
-                        .as_ref()
-                        .and_then(|x| if x.contains(&v) { Some(v) } else { None });
+                let fail_cell = fail_col_values.as_ref().and_then(|x| {
+                    if x.contains(&v) {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
                 match fail_cell {
                     Some(_) => {
                         fail_hit_cnt += 1;
-                        let is_failover_leader = c != fail_col.unwrap()
-                            && fail_leaders
-                                .as_mut()
-                                .and_then(|z| {
-                                    if z[group as usize] == v
-                                        && r % self.replication == failover_leader_target_replica
-                                    {
-                                        z[group as usize] = -v as i64;
-                                        leader_failover.push((v, c));
-                                        Some(&v)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .is_some();
-                        let color = if is_failover_leader {
+                        let is_failover_leader = leader_fail_match(rank, r, c, v, fail_col, fail_leaders.as_ref()).is_some();
+                        if is_failover_leader {
+                            fail_leaders.as_mut().and_then(|z| {
+                                z[rank] = -v;
+                                Some(v)
+                            });
+                            leader_failover.push((v, c));
                             leader_hit_cnt += 1;
+                        }
+                        let color = if is_failover_leader {
                             "red"
                         } else {
                             "blue"
                         };
                         if top {
-                            write_file_option!(
-                                file,
-                                "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>",
-                                color,
-                                c,
-                                group,
-                                v
-                            );
+                            write_file_option!(file, "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>", color, c, rank, v);
                         } else {
-                            write_file_option!(
-                                file,
-                                "<tr><td bgcolor=\"{}\">{}</td></tr>",
-                                color,
-                                v
-                            );
+                            write_file_option!(file, "<tr><td bgcolor=\"{}\">{}</td></tr>", color, v);
                         }
                     }
                     None => {
-                        let color = if is_leader_row { "orange" } else { "white" };
-                        if top {
-                            write_file_option!(
-                                file,
-                                "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>",
-                                color,
-                                c,
-                                group,
-                                v
-                            );
+                        let color = if is_leader_row {
+                            "orange"
                         } else {
-                            write_file_option!(
-                                file,
-                                "<tr><td bgcolor=\"{}\">{}</td></tr>",
-                                color,
-                                v
-                            );
+                            "white"
+                        };
+                        if top {
+                            write_file_option!(file, "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>", color, c, rank, v);
+                        } else {
+                            write_file_option!(file, "<tr><td bgcolor=\"{}\">{}</td></tr>", color, v);
                         }
                     }
                 }
             }
             write_file_option!(file, "<tr><td bgcolor=\"green\">{}</td></tr>", fail_hit_cnt);
-            write_file_option!(
-                file,
-                "<tr><td bgcolor=\"yellow\">{}</td></tr>",
-                leader_hit_cnt
-            );
+            write_file_option!(file, "<tr><td bgcolor=\"yellow\">{}</td></tr>", leader_hit_cnt);
             write_file_option!(file, "</table>>];");
             node_failover_to_nr[c] = fail_hit_cnt;
             node_leader_failover_to_nr[c] = leader_hit_cnt;
         }
         let color_cycle = ["black", "red"];
-        for group in 0..self.rows / self.replication {
-            let color = color_cycle[(group % 2) as usize];
+        for rank in 0..self.rows / self.replication {
+            let color = color_cycle[(rank % 2) as usize];
             for c in 0..self.cols - 1 {
                 if c > 0 {
-                    write_file_option!(
-                        file,
-                        "\thost{}:g{}{} -> host{}:g{}{} [ color=\"{}\" ];",
-                        c,
-                        c,
-                        group,
-                        c + 1,
-                        c + 1,
-                        group,
-                        color
-                    );
+                    write_file_option!(file, "\thost{}:g{}{} -> host{}:g{}{} [ color=\"{}\" ];", c, c, rank, c + 1, c + 1, rank, color);
                 } else {
-                    write_file_option!(
-                        file,
-                        "\thost{}:g{}{} -> host{}:g{}{} [ label=\"group{}\" color=\"{}\"];",
-                        c,
-                        c,
-                        group,
-                        c + 1,
-                        c + 1,
-                        group,
-                        group,
-                        color
-                    );
+                    write_file_option!(file, "\thost{}:g{}{} -> host{}:g{}{} [ label=\"group{}\" color=\"{}\"];", c, c, rank, c + 1, c + 1, rank, rank, color);
                 }
             }
         }
@@ -326,38 +288,32 @@ impl DotGraph for Matrix {
         println!("\nLeader_fail_over:\n {:?}", leader_failover);
         println!("\nFailover distribution:");
         for c in 0..self.cols {
-            println!(
-                "{:>w$} -> fail_over_hit: {} leader_hit: {}",
-                c,
-                node_failover_to_nr[c],
-                node_leader_failover_to_nr[c],
-                w = 2
-            );
+            println!("{:>w$} -> fail_over_hit: {} leader_hit: {}", c, node_failover_to_nr[c], node_leader_failover_to_nr[c], w = 2);
         }
     }
 }
 
 fn main() {
     let matches = clap_app!(app =>
-                            (version: "1.0")
-                            (author: "ChinaXing")
-                            (about: "calculate shard distribution on multiple nodes")
-                            (@arg matrix: -m --matrix "show matrix")
-                            (@arg thirdReplicaFailoverable: -t --thirdReplicaFailoverable "third replica can takeover for leader")
-                            (@arg failColumn: -f --failColumn +takes_value "mark failed column, start from 0")
-                            (@arg generateGraph: -g --generateDotGraph +takes_value "generate dot graph to file")
-                            (@arg javaArray: -j --generateJavaArray "generate a javaArray for matrix")
-                            (@arg matrixStart: -s --matrixStart +takes_value "start no of matrix, default 0")
-                            (@arg shardsPerNode: +required "shard num per node")
-                            (@arg nodeCount: +required "Node count")
-            )
+                    (version: "1.0")
+                    (author: "ChinaXing")
+                    (about: "calculate shard distribution on multiple nodes")
+                    (@arg matrix: -m --matrix "show matrix")
+                    (@arg balanceLeaderWhenFailOver: -l --balanceLeaderWhenFailOver "leader failover must can be balanced")
+                    (@arg failColumn: -f --failColumn +takes_value "mark failed column, start from 0")
+                    (@arg generateGraph: -g --generateDotGraph +takes_value "generate dot graph to file")
+                    (@arg javaArray: -j --generateJavaArray "generate a javaArray for matrix")
+                    (@arg matrixStart: -s --matrixStart +takes_value "start no of matrix, default 0")
+                    (@arg shardsPerNode: +required "shard num per node")
+                    (@arg nodeCount: +required "Node count")
+    )
     .get_matches();
     let rows = value_t!(matches.value_of("shardsPerNode"), usize).unwrap();
     let cols = value_t!(matches.value_of("nodeCount"), usize).unwrap();
     let fail_col = value_t!(matches.value_of("failColumn"), usize);
     let start_index = value_t!(matches.value_of("matrixStart"), i32);
-    let trf = matches.is_present("thirdReplicaFailoverable");
-    let m = distribute(rows, cols, start_index.unwrap_or(0), trf);
+    let blfo = matches.is_present("balanceLeaderWhenFailOver");
+    let m = distribute(rows, cols, start_index.unwrap_or(0), blfo);
     if matches.is_present("matrix") {
         println!("{}", m);
     }
@@ -370,20 +326,28 @@ fn main() {
     m.g(fc, graph_file);
 }
 
-fn distribute(rows: usize, cols: usize, start: i32, third_replica_failoverable: bool) -> Matrix {
-    let mut m: Matrix = Matrix::new(rows, cols, REPLICATION, start, third_replica_failoverable);
+fn distribute(rows: usize, cols: usize, start: i32, balance_leader_when_failover: bool) -> Matrix {
+    let mut m: Matrix = Matrix::new(rows, cols, REPLICATION, start, balance_leader_when_failover);
     for r in 0..rows {
         let rank = r / m.replication;
         let rep_index = r % m.replication;
         let base = rank * cols;
+        let rank_offset = rank % m.rank_cycle;
+        let rank_cycle_no = rank / m.rank_cycle;
+        let polar = rank_cycle_no % ((m.cols - 1) / m.rank_cycle) == 0;
         let offset = match rep_index {
             0 => 0,
-            1 => rank % m.rank_cycle + 1,
-            2 => rank % m.rank_cycle + 1 + m.third_shift[rank % m.rank_cycle],
+            1 => rank_offset + 1,
+            2 => rank_offset + 1 + m.third_shift[rank % m.rank_cycle],
             _ => panic!("invalid rep_index"),
         };
         for c in 0..cols {
-            let v = base + (offset + c) % cols;
+            let offset = if polar {
+                offset + c
+            } else {
+                cols + offset - c
+            };
+            let v = base + offset % cols;
             let cl = &mut m.data[c];
             cl[r as usize] = (v as i64) + (m.start_from as i64);
         }
