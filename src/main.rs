@@ -5,9 +5,6 @@ use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 
-#[macro_use]
-extern crate lazy_static;
-
 const REPLICATION: usize = 3;
 
 struct Matrix {
@@ -20,30 +17,17 @@ struct Matrix {
     data: Vec<Vec<i64>>,
 }
 
-lazy_static! {
-    static ref S18: Vec<usize> = [ // skip 8 (18/2-1)
-        (1usize..=7).collect::<Vec<usize>>().as_slice(),
-        (9..=17).collect::<Vec<usize>>().as_slice(),
-        &[2usize],
-    ]
-    .concat();
-    static ref S42: Vec<usize> = [ // skip 20 (42/2-1)
-        (1usize..=19).collect::<Vec<usize>>().as_slice(),
-        (21..=41).collect::<Vec<usize>>().as_slice(),
-        &[2usize],
-    ]
-    .concat();
-}
-
-pub fn build_third_shift(rank_cycle: usize, rank_size: usize) -> Vec<usize> {
-    let r = if rank_size % 2 == 1 {
+pub fn build_third_shift(rank_cycle: usize, col_size: usize) -> Vec<usize> {
+    let r = if col_size % 2 == 1 {
         (1usize..=rank_cycle).collect::<Vec<usize>>()
     } else {
-        match (rank_cycle, rank_size) {
-            (17, 18) => S18.to_vec(),
-            (41, 42) => S42.to_vec(),
-            _ => panic!("can not handle rank_cycle !!"),
-        }
+        (1usize..)
+            .filter(|&x| x != col_size / 2 - 1) // prevent : col_size/2 + col_size/2 == col_size
+            .filter(|&y| y != col_size) // prevent : col_size == col_size
+            .filter(|&z| z != col_size + 1) // prevent : col_size - 1 + (1 mod col_size)
+            .map(|k| k % col_size)
+            .take(rank_cycle)
+            .collect::<Vec<usize>>()
     };
     println!("- Third Replica Shift: {:?}", r);
     r
@@ -51,7 +35,7 @@ pub fn build_third_shift(rank_cycle: usize, rank_size: usize) -> Vec<usize> {
 
 impl Matrix {
     pub fn new(r: usize, c: usize, rep: usize, s: i32, balance_leader_when_failover: bool) -> Matrix {
-        let rc = if (c - 1) % 2 == 0 {
+        let rank_cycle = if (c - 1) % 2 == 0 {
             // if leader must balance after failover, we need double the minimal rank cycle,
             // because it will be half of health nodes
             if balance_leader_when_failover {
@@ -62,18 +46,18 @@ impl Matrix {
         } else {
             c - 1
         };
-        println!("- Rank Cycle : {}", rc);
-        let ts = build_third_shift(rc, c);
+        println!("- Rank Cycle : {}", rank_cycle);
+        let ts = build_third_shift(rank_cycle, c);
         // check rows
-        if r % (rep * rc) != 0 {
-            panic!("rows : {} must multiple of : replication * rank_cycle = {} * {}", r, rep, rc);
+        if r % (rep * rank_cycle) != 0 {
+            panic!("rows : {} must multiple of : replication * rank_cycle = {} * {}", r, rep, rank_cycle);
         }
         Matrix {
             start_from: s,
             rows: r,
             cols: c,
             replication: rep,
-            rank_cycle: rc,
+            rank_cycle: rank_cycle,
             third_shift: ts,
             data: vec![vec![0; r as usize]; c as usize],
         }
@@ -191,26 +175,33 @@ impl DotGraph for Matrix {
         write_file_option!(file, "digraph G {{");
         write_file_option!(file, "\trankdir=LR;");
         let data = &self.data;
-        let leader_fail_match = |rank: usize, row: usize, col: usize, v: i64, fc: Option<usize>, fl: Option<&Vec<i64>>| {
-            fc.and_then(|x| {
-                if x != col {
-                    Some(x)
-                } else {
-                    None
-                }
-            })
-            .and_then(move |_y| {
-                fl.and_then(move |z| {
-                    if z[rank] == v && row % self.replication == 1 {
-                        Some(v)
+        let leader_fail_match =
+            |rank: usize, row: usize, col: usize, v: i64, fc: Option<usize>, fl: Option<&Vec<i64>>| {
+                fc.and_then(|x| {
+                    if x != col {
+                        Some(x)
                     } else {
                         None
                     }
                 })
-            })
-        };
+                .and_then(move |_y| {
+                    fl.and_then(move |z| {
+                        if z[rank] == v && row % self.replication == 1 {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })
+                })
+            };
         for c in 0..self.cols {
-            write_file_option!(file, "\thost{} [shape=none label=<<table><tr><td bgcolor=\"black\"><font color=\"white\">Node-{}</font></td></tr>", c, c,);
+            write_file_option!(
+                file,
+                "\thost{} [shape=none label=<<table><tr><td bgcolor=\"black\"><font \
+                 color=\"white\">Node-{}</font></td></tr>",
+                c,
+                c,
+            );
             let mut fail_hit_cnt = 0;
             let mut leader_hit_cnt = 0;
             for r in 0..self.rows {
@@ -230,7 +221,8 @@ impl DotGraph for Matrix {
                 match fail_cell {
                     Some(_) => {
                         fail_hit_cnt += 1;
-                        let is_failover_leader = leader_fail_match(rank, r, c, v, fail_col, fail_leaders.as_ref()).is_some();
+                        let is_failover_leader =
+                            leader_fail_match(rank, r, c, v, fail_col, fail_leaders.as_ref()).is_some();
                         if is_failover_leader {
                             fail_leaders.as_mut().and_then(|z| {
                                 z[rank] = -v;
@@ -245,7 +237,14 @@ impl DotGraph for Matrix {
                             "blue"
                         };
                         if top {
-                            write_file_option!(file, "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>", color, c, rank, v);
+                            write_file_option!(
+                                file,
+                                "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>",
+                                color,
+                                c,
+                                rank,
+                                v
+                            );
                         } else {
                             write_file_option!(file, "<tr><td bgcolor=\"{}\">{}</td></tr>", color, v);
                         }
@@ -257,7 +256,14 @@ impl DotGraph for Matrix {
                             "white"
                         };
                         if top {
-                            write_file_option!(file, "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>", color, c, rank, v);
+                            write_file_option!(
+                                file,
+                                "<tr><td bgcolor=\"{}\" port=\"g{}{}\">{}</td></tr>",
+                                color,
+                                c,
+                                rank,
+                                v
+                            );
                         } else {
                             write_file_option!(file, "<tr><td bgcolor=\"{}\">{}</td></tr>", color, v);
                         }
@@ -275,9 +281,30 @@ impl DotGraph for Matrix {
             let color = color_cycle[(rank % 2) as usize];
             for c in 0..self.cols - 1 {
                 if c > 0 {
-                    write_file_option!(file, "\thost{}:g{}{} -> host{}:g{}{} [ color=\"{}\" ];", c, c, rank, c + 1, c + 1, rank, color);
+                    write_file_option!(
+                        file,
+                        "\thost{}:g{}{} -> host{}:g{}{} [ color=\"{}\" ];",
+                        c,
+                        c,
+                        rank,
+                        c + 1,
+                        c + 1,
+                        rank,
+                        color
+                    );
                 } else {
-                    write_file_option!(file, "\thost{}:g{}{} -> host{}:g{}{} [ label=\"group{}\" color=\"{}\"];", c, c, rank, c + 1, c + 1, rank, rank, color);
+                    write_file_option!(
+                        file,
+                        "\thost{}:g{}{} -> host{}:g{}{} [ label=\"group{}\" color=\"{}\"];",
+                        c,
+                        c,
+                        rank,
+                        c + 1,
+                        c + 1,
+                        rank,
+                        rank,
+                        color
+                    );
                 }
             }
         }
@@ -288,7 +315,13 @@ impl DotGraph for Matrix {
         println!("\nLeader_fail_over:\n {:?}", leader_failover);
         println!("\nFailover distribution:");
         for c in 0..self.cols {
-            println!("{:>w$} -> fail_over_hit: {} leader_hit: {}", c, node_failover_to_nr[c], node_leader_failover_to_nr[c], w = 2);
+            println!(
+                "{:>w$} -> fail_over_hit: {} leader_hit: {}",
+                c,
+                node_failover_to_nr[c],
+                node_leader_failover_to_nr[c],
+                w = 2
+            );
         }
     }
 }
